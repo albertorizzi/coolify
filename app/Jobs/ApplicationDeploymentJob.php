@@ -52,6 +52,8 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
 
     private const RAILPACK_GENERATED_CONFIG_PATH = '.coolify/railpack.generated.json';
 
+    private const CONTAINER_REMOVE_TIMEOUT_MARKER = '__COOLIFY_CONTAINER_REMOVE_TIMEOUT__';
+
     private const DOCKER_CLIENT_ENV_KEYS = [
         'BUILDKIT_HOST',
         'BUILDX_BUILDER',
@@ -259,14 +261,7 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
         $this->configuration_dir = application_configuration_dir()."/{$this->application->uuid}";
         $this->is_debug_enabled = $this->application->settings->is_debug_enabled;
 
-        $this->container_name = generateApplicationContainerName($this->application, $this->pull_request_id);
-        if ($this->application->settings->custom_internal_name && ! $this->application->settings->is_consistent_container_name_enabled) {
-            if ($this->pull_request_id === 0) {
-                $this->container_name = $this->application->settings->custom_internal_name;
-            } else {
-                $this->container_name = addPreviewDeploymentSuffix($this->application->settings->custom_internal_name, $this->pull_request_id);
-            }
-        }
+        $this->container_name = $this->resolveContainerName();
 
         $this->saved_outputs = collect();
 
@@ -610,6 +605,10 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
     {
         if ($this->pull_request_id !== 0 && str($this->dockerImagePreviewTag)->isNotEmpty()) {
             return $this->dockerImagePreviewTag;
+        }
+
+        if ($this->rollback && str($this->commit)->isNotEmpty()) {
+            return $this->commit;
         }
 
         if (str($this->application->docker_registry_image_tag)->isNotEmpty()) {
@@ -1980,6 +1979,19 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
         }
     }
 
+    private function resolveContainerName(): string
+    {
+        if (str($this->application->settings->custom_internal_name)->isEmpty()) {
+            return generateApplicationContainerName($this->application, $this->pull_request_id);
+        }
+
+        if ($this->pull_request_id === 0) {
+            return $this->application->settings->custom_internal_name;
+        }
+
+        return addPreviewDeploymentSuffix($this->application->settings->custom_internal_name, $this->pull_request_id);
+    }
+
     private function health_check()
     {
         try {
@@ -2268,9 +2280,9 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
             $fqdn = $this->preview->fqdn;
         }
         if (isset($fqdn)) {
-            $url = Url::fromString($fqdn);
-            $fqdn = $url->getHost();
-            $url = $url->withHost($fqdn)->withPort(null)->__toString();
+            $domains = str($fqdn)->explode(',')->map(fn (string $domain) => trim($domain))->filter();
+            $url = $domains->map(fn (string $domain) => Url::fromString($domain)->withPort(null)->__toString())->implode(',');
+            $fqdn = $domains->map(fn (string $domain) => Url::fromString($domain)->getHost())->implode(',');
             if ((int) $this->application->compose_parsing_version >= 3) {
                 $this->coolify_variables .= 'COOLIFY_URL='.escapeShellValue($url).' ';
                 $this->coolify_variables .= 'COOLIFY_FQDN='.escapeShellValue($fqdn).' ';
@@ -3295,6 +3307,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         // Always use .env file
         $docker_compose['services'][$this->container_name]['env_file'] = ['.env'];
 
+        if ($this->application->settings->stop_grace_period !== null) {
+            $docker_compose['services'][$this->container_name]['stop_grace_period'] = $this->application->settings->stopGracePeriodSeconds().'s';
+        }
+
         // Only add Coolify healthcheck if no custom HEALTHCHECK found in Dockerfile
         // If custom_healthcheck_found is true, the Dockerfile's HEALTHCHECK will be used
         // If healthcheck is disabled, no healthcheck will be added
@@ -3417,24 +3433,22 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if ($this->pull_request_id === 0) {
             $custom_compose = convertDockerRunToCompose($this->application->custom_docker_run_options);
             if ((bool) $this->application->settings->is_consistent_container_name_enabled) {
-                if (! $this->application->settings->custom_internal_name) {
-                    $docker_compose['services'][$this->application->uuid] = $docker_compose['services'][$this->container_name];
-                    if (count($custom_compose) > 0) {
-                        $ipv4 = data_get($custom_compose, 'ip.0');
-                        $ipv6 = data_get($custom_compose, 'ip6.0');
-                        data_forget($custom_compose, 'ip');
-                        data_forget($custom_compose, 'ip6');
-                        if ($ipv4 || $ipv6) {
-                            data_forget($docker_compose['services'][$this->application->uuid], 'networks');
-                        }
-                        if ($ipv4) {
-                            $docker_compose['services'][$this->application->uuid]['networks'][$this->destination->network]['ipv4_address'] = $ipv4;
-                        }
-                        if ($ipv6) {
-                            $docker_compose['services'][$this->application->uuid]['networks'][$this->destination->network]['ipv6_address'] = $ipv6;
-                        }
-                        $docker_compose['services'][$this->application->uuid] = array_merge_recursive($docker_compose['services'][$this->application->uuid], $custom_compose);
+                $docker_compose['services'][$this->application->uuid] = $docker_compose['services'][$this->container_name];
+                if ($this->container_name !== $this->application->uuid) {
+                    unset($docker_compose['services'][$this->container_name]);
+                }
+                if (count($custom_compose) > 0) {
+                    $ipv4 = data_get($custom_compose, 'ip.0');
+                    $ipv6 = data_get($custom_compose, 'ip6.0');
+                    data_forget($custom_compose, 'ip');
+                    data_forget($custom_compose, 'ip6');
+                    if ($ipv4) {
+                        $docker_compose['services'][$this->application->uuid]['networks'][$this->destination->network]['ipv4_address'] = $ipv4;
                     }
+                    if ($ipv6) {
+                        $docker_compose['services'][$this->application->uuid]['networks'][$this->destination->network]['ipv6_address'] = $ipv6;
+                    }
+                    $docker_compose['services'][$this->application->uuid] = array_merge_recursive($docker_compose['services'][$this->application->uuid], $custom_compose);
                 }
             } else {
                 if (count($custom_compose) > 0) {
@@ -3977,13 +3991,43 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 );
             } else {
                 $this->execute_remote_command(
-                    [dockerStopCommand($timeout, $containerName, $this->server), 'hidden' => true, 'ignore_errors' => true],
-                    ["docker rm -f $containerName", 'hidden' => true, 'ignore_errors' => true]
+                    [dockerStopCommand($timeout, $containerName, $this->server), 'hidden' => true, 'ignore_errors' => true]
                 );
+                $this->removeContainerWithTimeout($containerName);
             }
         } catch (Exception $error) {
             $this->application_deployment_queue->addLogEntry("Error stopping container $containerName: ".$error->getMessage(), 'stderr');
         }
+    }
+
+    private function removeContainerWithTimeout(string $containerName): void
+    {
+        $outputKey = 'container_remove_'.md5($containerName);
+
+        $this->execute_remote_command([
+            dockerRemoveCommandWithTimeout($containerName),
+            'hidden' => true,
+            'ignore_errors' => true,
+            'save' => $outputKey,
+            'append' => false,
+        ]);
+
+        if (! isset($this->saved_outputs)) {
+            return;
+        }
+
+        $output = (string) $this->saved_outputs->get($outputKey, '');
+        if (! str_contains($output, self::CONTAINER_REMOVE_TIMEOUT_MARKER)) {
+            return;
+        }
+
+        $this->application_deployment_queue->addLogEntry(
+            "Warning: Removing container {$containerName} timed out after 60 seconds. The deployment will continue and cleanup will be retried in 5 minutes.",
+            'stderr'
+        );
+
+        RemoveContainerJob::dispatch($this->server->id, $containerName)
+            ->delay(now()->addMinutes(5));
     }
 
     private function stop_running_container(bool $force = false)
@@ -3992,7 +4036,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             $this->application_deployment_queue->addLogEntry('Removing old containers.');
             if ($this->newVersionIsHealthy || $force) {
                 if ($this->application->settings->is_consistent_container_name_enabled || str($this->application->settings->custom_internal_name)->isNotEmpty()) {
-                    $this->graceful_shutdown_container($this->container_name);
+                    $containers = getCurrentApplicationContainerStatus($this->server, $this->application->id, $this->pull_request_id);
+                    $this->containerNamesToRemove($containers)->each(function (string $containerName) {
+                        $this->graceful_shutdown_container($containerName);
+                    });
                 } else {
                     $containers = getCurrentApplicationContainerStatus($this->server, $this->application->id, $this->pull_request_id);
                     if ($this->pull_request_id === 0) {
@@ -4029,6 +4076,16 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             // Only re-throw if deployment hasn't succeeded yet
             throw new DeploymentException("Failed to stop running container: {$e->getMessage()}", $e->getCode(), $e);
         }
+    }
+
+    private function containerNamesToRemove(Collection $containers): Collection
+    {
+        return $containers
+            ->pluck('Names')
+            ->push($this->container_name)
+            ->filter()
+            ->unique()
+            ->values();
     }
 
     private function start_by_compose_file()
@@ -5016,9 +5073,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                     // do not remove already running container for PR deployments
                 } else {
                     $this->application_deployment_queue->addLogEntry('Deployment failed. Removing the new version of your application.', 'stderr');
-                    $this->execute_remote_command(
-                        ["docker rm -f $this->container_name >/dev/null 2>&1", 'hidden' => true, 'ignore_errors' => true]
-                    );
+                    $this->removeContainerWithTimeout($this->container_name);
                 }
             }
         }

@@ -12,6 +12,8 @@ use App\Models\GitlabApp;
 use App\Models\InstanceSettings;
 use App\Models\LocalFileVolume;
 use App\Models\LocalPersistentVolume;
+use App\Models\Project;
+use App\Models\S3Storage;
 use App\Models\Server;
 use App\Models\Service;
 use App\Models\ServiceApplication;
@@ -815,6 +817,54 @@ function firstDomainFromList(?string $fqdns): string
 {
     return trim((string) str($fqdns ?? '')->explode(',')->first());
 }
+function profile_avatar_url(User $user): string
+{
+    if ($user->avatar_storage_type === 's3') {
+        $url = s3_image_url($user->avatar_s3_storage_id, $user->avatar_path, $user->updated_at->timestamp);
+        if ($url) {
+            return $url;
+        }
+    }
+
+    return route('profile.avatar', ['v' => $user->updated_at->timestamp]);
+}
+
+function project_icon_url(Project $project): string
+{
+    if ($project->icon_storage_type === 's3') {
+        $url = s3_image_url($project->icon_s3_storage_id, $project->icon_path, $project->updated_at->timestamp);
+        if ($url) {
+            return $url;
+        }
+    }
+
+    return route('project.icon', [
+        'project_uuid' => $project->uuid,
+        'v' => $project->updated_at->timestamp,
+    ]);
+}
+
+function s3_image_url(?int $storageId, ?string $path, int $version): ?string
+{
+    if (! $storageId || blank($path)) {
+        return null;
+    }
+
+    $storage = S3Storage::query()
+        ->whereKey($storageId)
+        ->whereTeamId(0)
+        ->where('is_usable', true)
+        ->first();
+
+    if (! $storage) {
+        return null;
+    }
+
+    $baseUrl = config('constants.coolify.avatar_cdn_url') ?: $storage->awsUrl();
+
+    return rtrim($baseUrl, '/').'/'.ltrim($path, '/').'?v='.$version;
+}
+
 /**
  * If fqdn is set, return it, otherwise return public ip.
  */
@@ -2068,7 +2118,7 @@ function validateDNSEntry(string $fqdn, Server $server)
     $type = dnsRecordTypeForIp($ip) === 'AAAA' ? DNSTypes::NAME_AAAA : DNSTypes::NAME_A;
     foreach ($dns_servers as $dns_server) {
         try {
-            $query = new DNSQuery($dns_server);
+            $query = createDnsQuery($dns_server);
             $results = $query->query($host, $type);
             if ($results === false || $query->hasError()) {
             } else {
@@ -2076,11 +2126,11 @@ function validateDNSEntry(string $fqdn, Server $server)
                     if ($result->getType() == $type) {
                         if (isCloudflareIp($result->getData())) {
                             $found_matching_ip = true;
-                            break;
+                            break 2;
                         }
                         if ($ip && $result->getData() === $ip) {
                             $found_matching_ip = true;
-                            break;
+                            break 2;
                         }
                     }
                 }
@@ -2090,6 +2140,15 @@ function validateDNSEntry(string $fqdn, Server $server)
     }
 
     return $found_matching_ip;
+}
+
+function createDnsQuery(string $dnsServer): DNSQuery
+{
+    return app()->make(DNSQuery::class, [
+        'server' => $dnsServer,
+        'port' => 53,
+        'timeout' => 5,
+    ]);
 }
 
 function isCloudflareIp(string $ip): bool
@@ -4143,11 +4202,12 @@ function coolifyHelperImage(): string
 
 function getHelperVersion(): string
 {
-    $settings = instanceSettings();
+    if (isDev()) {
+        $devHelperVersion = InstanceSettings::query()->whereKey(0)->value('dev_helper_version');
 
-    // In development mode, use the dev_helper_version if set, otherwise fallback to config
-    if (isDev() && ! empty($settings->dev_helper_version)) {
-        return $settings->dev_helper_version;
+        if (! empty($devHelperVersion)) {
+            return $devHelperVersion;
+        }
     }
 
     return config('constants.coolify.helper_version');

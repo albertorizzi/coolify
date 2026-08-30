@@ -867,6 +867,37 @@ All notable changes to this project will be documented in this file.
 - *(ui)* Add admin navigation link for root users
 - *(ui)* Show Coolify version in mobile sidebar
 - *(storage)* Persist local images and unify clipboard copying
+- *(domains)* Add configurable HTTPS redirects for service apps
+- Add configurable Horizon dashboard admin access
+- *(horizon)* Read allowed emails from config and allow root user by id
+- Add configurable Horizon dashboard access (#9354)
+- *(development)* Add QEMU VM provisioning and server seeding
+- *(platform)* Support SMTP EHLO, page-preserving teams, and upgrades
+- *(api)* Add instance email settings endpoints
+- *(ci)* Add next build and RC release workflows
+- *(auth)* Add OIDC SSO and registration controls
+- *(auth)* Auto-join OAuth users to root team
+- *(auth)* Consolidate OAuth settings into standard authentication page
+- *(auth)* Improve OAuth buttons and OIDC settings layout
+- *(auth)* Add OIDC SSO and registration controls (#10543)
+- *(security)* Add Cloudflare integration token management
+- *(security)* Add integration token editing and rotation
+- *(security)* Add Cloudflare integration token management (#11359)
+- *(server)* Support Alpine package management and Docker setup
+- *(ui)* Add copy icon
+- *(ui)* Add shared copy button component
+- *(ui)* Use the shared copy button component everywhere
+- *(ui)* Add some animations to the copy button
+- *(var)* Add environment variable copy functionality
+- *(ui)* Add copy button to environment variable page
+- *(var)* Environment variable copy button (#11379)
+- *(domains)* Add asynchronous DNS validation
+- *(livewire)* Handle infrastructure request failures with toast
+- *(templates)* Add HashiCorp Vault service template
+- *(templates)* Add Obsidian LiveSync CouchDB service template
+- *(services)* Add Executor one-click deployment template (#11530)
+- *(media)* Serve avatars and project icons from S3 or CDN
+- *(previews)* Add preview domain management and DNS status tracking
 
 ### 🐛 Bug Fixes
 
@@ -2533,6 +2564,116 @@ All notable changes to this project will be documented in this file.
 - *(ui)* Improve listbox hover state and Traefik redirects
 - *(ui)* Use solid surfaces for deployment indicator states
 - *(modal)* Use checkbox ids for Livewire bindings (#11335)
+- Honor GitHub default branches and reconcile proxy networks
+- Select Traefik networks and stabilize dropdown positioning
+- *(postgresql)* Persist selected public access state
+- *(postgresql)* Persist selected public access state (#11348)
+- *(table)* Preserve computed dropdown top position
+- *(table)* Keep page-size dropdown within viewport (#11349)
+- *(authorization)* Gate mutable Livewire controls by policy
+- *(upgrade)* Handle missing status after restart (#11350)
+- *(databases)* Redirect stdin for the SSL cert chown
+- *(databases)* Redirect stdin for the SSL cert chown (#11315)
+- Compress dashboard over HTTPS (#10828)
+- *(notification)* Update storage email link in S3 error (#8633)
+- *(databases)* Chown SSL certs before container replacement (#11352)
+- *(ui)* Improve highlighted button and spinner contrast (#11279)
+- *(webhook)* Restore GitLab source deployments (#11284)
+- *(deployments)* Defer container cleanup and configure dashboard HTTPS
+- *(ui)* Add spacing between database backup sections
+- *(server)* Surface pending proxy and outdated Traefik states
+- *(logs)* Clean up deployment log scrolling on teardown
+- *(services)* Avoid reading bind-mount files when syncing volumes
+- Cap remote logs, tasks, and config output sizes
+- Measure log size before ANSI strip; harden tasks and volumes
+- Cap remote file and task reads after size-check races
+- Enforce remote output size limits
+- *(services)* Avoid loading bind-mount file contents (#10960)
+- *(backups)* Support long-running volume backups
+- *(ui)* Show server warnings with alert icons
+- *(sentinel)* Clarify restart after settings update
+- *(backups)* Preserve existing volume backup timeouts
+- *(backups)* Preserve existing volume backup timeouts
+- *(backups)* Support long-running volume backups (#11358)
+- *(security)* Enforce team-scoped authorization for scheduled tasks (#11239)
+- *(oauth)* Prevent data loss during OAuth settings re-seed (#8210)
+- Wrap seeders in db transactions (#11360)
+- *(ui)* Close account menu on outside click when appearance is expanded (#11374)
+- *(ui)* Center icon tooltips over their trigger (#11382)
+- *(ssh)* Preserve sessions when recycling mux connections (#11377)
+- *(dns)* Time out validation queries after five seconds (#11378)
+- *(ui)* Flag pending proxy updates and Sentinel outages
+- *(email)* Apply configured sender identity (#11393)
+- *(email)* Respect disabled SMTP encryption in test emails (#11384)
+- *(email)* Support custom SMTP EHLO domains (#11398)
+- *(api-tokens)* Scope token access to current team (#11396)
+- *(email)* Prevent Proton SMTP From header folding (#11400)
+- *(upgrade)* Persist target image before container recreation (#11401)
+- *(settings)* Harden OIDC, email, and log drain flows
+- *(auth)* Refresh OIDC JWKS and block unverified account linking
+- *(settings)* Bind settings resource in advanced options
+- *(auth)* Store OIDC raw claims as arrays
+- *(auth)* Block OIDC token exchange without PKCE verifier
+- *(auth)* Avoid caching invalid OIDC discovery documents
+- *(auth)* Preserve OAuth identity across email changes
+- *(auth)* Reject OAuth logins without valid provider IDs
+- *(auth)* Handle concurrent OAuth identity creation safely
+- *(auth)* Preserve OAuth identity across email changes (#11357)
+- *(caddy)* Prevent exact label generation argument error (#11397)
+- *(ci)* Allow RC workflow to revalidate prereleases
+- *(services)* Handle empty compose environment sections (#11407)
+- *(docker-cleanup)* Finalize executions after job failure (#11408)
+- *(teams)* Restrict deletion to owners and backfill team ownership
+- *(auth)* Require confirmation before accepting magic links (#11413)
+- *(teams)* Make membership and source deletions atomic
+- *(resources)* Preserve deletion when remote cleanup fails
+- Align resource access checks
+- *(api)* Align team-scoped responses
+- *(deployments)* Ignore newly tracked static configuration (#11430)
+- *(ui)* Release modal scroll lock before confirmation submission
+- *(domains)* Allow adding domains without explicit ports (#11442)
+- Adjust dropdown transition margin for improved UI layout
+- *(storage)* Clarify source path removal impact
+- *(storage)* Guard volume names and authorize source removal
+- *(var)* Fail on missing user when hiding env values
+- *(ci)* Protect main during sync conflicts
+- *(terminal)* Distinguish containers across servers
+- *(api)* Allow system-wide GitHub Apps across teams (#11453)
+- *(docker)* Update helper CLI for registry pushes (#11461)
+- *(previews)* Remove persistent volumes on deletion (#11455)
+- *(docker)* Make cleanup commands idempotent (#11463)
+- *(proxy)* Restore project networks after host reboot (#11476)
+- *(docker)* Handle commas in container label values (#11477)
+- *(livewire)* Refresh service config after required variable updates
+- *(server)* Distinguish proxy restart and update statuses
+- *(deployments)* Honor selected Docker image rollback tag (#11480)
+- *(database)* Restore custom PostgreSQL backup archives (#11481)
+- *(api)* Accept cuid for private_key_uuid on GitHub App update (#11468)
+- *(security)* Redact dotted GitHub tokens and contain wide data tables
+- *(teams)* Allow deletion with unused private keys (#11499)
+- *(teams)* Allow deletion with system-wide Git sources (#11500)
+- *(deployments)* Honor stop grace period in compose services (#11498)
+- *(deployments)* Restore commit links in deployment logs (#11495)
+- *(deployments)* Apply custom docker options when custom container name is set (#11479)
+- *(resources)* Make cleanup scalable and deletion atomic
+- *(resources)* Schedule stuck cleanup and delete metadata before jobs
+- *(security)* Preserve private key editor modal identity (#11497)
+- *(proxy)* Clear stale Traefik branch upgrade warnings (#11496)
+- *(server)* Reset unreachable_count after successful connection check (#11417)
+- *(ui)* Monaco editor placeholder alignment (#11514)
+- *(auth)* Rate limit by proxy-aware client ip instead of REMOTE_ADDR
+- *(auth)* Rate limit by proxy-aware client IP (#11515)
+- *(auth)* Use Cloudflare client IP for authentication rate limits
+- *(auth)* Queue verification emails for cloud registrations
+- *(services)* Add CDN and default logo fallbacks
+- *(server)* Allow sentinel startup migrations to finish
+- *(livewire)* Prevent stale keys and refresh races
+- *(domains)* Reject single-label hostnames for app and service domains
+- Preserve custom names and use Livewire redirects
+- *(docker)* Create standalone networks without the swarm driver
+- *(realtime)* Harden terminal command handling
+- Update resource forms
+- *(deployments)* Keep every domain intact in COOLIFY_URL and COOLIFY… (#11527)
 
 ### 💼 Other
 
@@ -3031,6 +3172,8 @@ All notable changes to this project will be documented in this file.
 - *(ui)* Remove deploy confirmation modals (#11023)
 - *(application)* Extract status and internal access components
 - *(ui)* Fill resource logo tiles and support light/dark logo variants
+- *(storage)* Separate volumes from directory mounts
+- *(ui)* Rename forms.copy-button to forms.copy-input
 
 ### 📚 Documentation
 
@@ -3161,6 +3304,7 @@ All notable changes to this project will be documented in this file.
 - *(release)* Clarify branch strategy and SHA build flow
 - *(ui)* Clarify application image retention cleanup options
 - Design external TLS redirect control
+- Update changelog
 
 ### ⚡ Performance
 
@@ -3239,6 +3383,10 @@ All notable changes to this project will be documented in this file.
 - *(github)* Cover PR previews without skip ci
 - *(browser)* Expand config coverage and shared helpers
 - *(models)* Cover finished_at datetime cast
+- Align deployment config redaction expectations
+- Update tests for the new copy button component
+- *(var)* Fix env variable tests
+- Fix instance settings creation
 
 ### ⚙️ Miscellaneous Tasks
 
@@ -3569,6 +3717,20 @@ All notable changes to this project will be documented in this file.
 - *(release)* Bump Coolify and nightly versions
 - *(release)* Bump Coolify versions to 4.3.6 and 4.3.7
 - *(release)* Bump Coolify versions to 4.3.8
+- *(release)* Bump Coolify versions to 4.3.9
+- Remove horizon var from .env.development
+- Sync main changes to next
+- Use current checkout action for branch sync
+- Ignore superpowers plan files
+- *(ui)* Improve clarity of generate proxy label options (#11362)
+- *(release)* Bump Coolify versions to 4.3.10 and 4.3.11
+- Remove legacy Dusk tests and configure maintenance driver
+- Remove global copyToClipboard helper
+- *(releases)* Bump helper version to 1.0.16
+- *(helper)* Enable manual workflow dispatch
+- *(release)* Bump Coolify version to 4.3.12
+- Prepare v4.3.15
+- *(release)* Bump Coolify to 4.3.15 and realtime to 1.0.18
 
 ### ◀️ Revert
 

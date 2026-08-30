@@ -7,7 +7,9 @@
         alwaysScroll: false,
         followManuallyDisabled: false,
         rafId: null,
+        scrollTimeout: null,
         scrollDebounce: null,
+        destroyed: false,
         colorLogs: localStorage.getItem('coolify-color-logs') === 'true',
         logFilters: JSON.parse(localStorage.getItem('coolify-log-filters')) || {error: true, warning: true, debug: true, info: true},
         searchQuery: '',
@@ -17,10 +19,7 @@
             this.fullscreen = !this.fullscreen;
             if (this.fullscreen === false) {
                 this.alwaysScroll = false;
-                if (this.rafId) {
-                    cancelAnimationFrame(this.rafId);
-                    this.rafId = null;
-                }
+                this.cancelScrollLoop();
             }
         },
         handleKeyDown(event) {
@@ -33,9 +32,20 @@
         disableFollow() {
             if (!this.alwaysScroll) return;
             this.alwaysScroll = false;
+            this.cancelScrollLoop();
+        },
+        cancelScrollLoop() {
             if (this.rafId) {
                 cancelAnimationFrame(this.rafId);
                 this.rafId = null;
+            }
+            if (this.scrollTimeout) {
+                clearTimeout(this.scrollTimeout);
+                this.scrollTimeout = null;
+            }
+            if (this.scrollDebounce) {
+                clearTimeout(this.scrollDebounce);
+                this.scrollDebounce = null;
             }
         },
         handleWheel(event) {
@@ -62,7 +72,8 @@
             }
         },
         scrollToBottom() {
-            const logsContainer = document.getElementById('logsContainer');
+            if (this.destroyed) return;
+            const logsContainer = this.$root.querySelector('#logsContainer');
             if (logsContainer) {
                 this.isScrolling = true;
                 logsContainer.scrollTop = logsContainer.scrollHeight;
@@ -70,11 +81,12 @@
             }
         },
         scheduleScroll() {
-            if (!this.alwaysScroll) return;
+            if (!this.alwaysScroll || this.destroyed) return;
             this.rafId = requestAnimationFrame(() => {
+                if (!this.alwaysScroll || this.destroyed) return;
                 this.scrollToBottom();
-                if (this.alwaysScroll) {
-                    setTimeout(() => this.scheduleScroll(), 250);
+                if (this.alwaysScroll && !this.destroyed) {
+                    this.scrollTimeout = setTimeout(() => this.scheduleScroll(), 250);
                 }
             });
         },
@@ -85,16 +97,14 @@
                 this.scheduleScroll();
             } else {
                 this.followManuallyDisabled = true;
-                if (this.rafId) {
-                    cancelAnimationFrame(this.rafId);
-                    this.rafId = null;
-                }
+                this.cancelScrollLoop();
             }
         },
         handleScroll(event) {
-            if (this.isScrolling) return;
+            if (this.isScrolling || this.destroyed) return;
             clearTimeout(this.scrollDebounce);
             this.scrollDebounce = setTimeout(() => {
+                if (this.destroyed) return;
                 const el = event.target;
                 const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
                 if (!this.alwaysScroll && !this.followManuallyDisabled && distanceFromBottom <= 10) {
@@ -253,6 +263,11 @@
                     applyAfterUpdate();
                 }
             });
+        },
+        destroy() {
+            this.destroyed = true;
+            this.alwaysScroll = false;
+            this.cancelScrollLoop();
         }
     }" @keydown.window="handleKeyDown($event)">
         @if ($collapsible)
@@ -498,19 +513,23 @@
                     @if ($outputs)
                         @php
                             $displayLines = collect(explode("\n", $outputs))->filter(fn($line) => trim($line) !== '');
+                            $lineOccurrences = [];
                         @endphp
                         <div id="logs" class="font-logs max-w-full cursor-default text-[11px] leading-relaxed sm:text-xs">
                             <div x-show="searchQuery.trim() && matchCount === 0"
                                 class="py-2 text-gray-500 dark:text-gray-400">
                                 No matches found.
                             </div>
-                            @foreach ($displayLines as $index => $line)
+                            @foreach ($displayLines as $line)
                                 @php
+                                    $lineFingerprint = md5($line);
+                                    $lineOccurrence = $lineOccurrences[$lineFingerprint] ?? 0;
+                                    $lineOccurrences[$lineFingerprint] = $lineOccurrence + 1;
+
                                     // Parse timestamp from log line (ISO 8601 format: 2025-12-04T11:48:39.136764033Z)
                                     $timestamp = '';
                                     $logContent = $line;
                                     if (preg_match('/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z?\s(.*)$/', $line, $matches)) {
-                                        $microseconds = isset($matches[2]) ? substr($matches[2], 0, 6) : '000000';
                                         $logContent = $matches[3];
 
                                         // Convert UTC Docker timestamp to server timezone for display
@@ -522,11 +541,9 @@
                                             // keep UTC
                                         }
                                         $timestamp = $carbonTs->format('Y-M-d H:i:s');
-                                        // Include microseconds in key for uniqueness
-                                        $lineKey = "{$timestamp}.{$microseconds}";
                                     }
                                 @endphp
-                                <div wire:key="{{ $lineKey ?? 'line-' . $index }}" data-log-line data-log-content="{{ $line }}" class="log-line logs-viewer-line">
+                                <div wire:key="log-{{ $lineFingerprint }}-{{ $lineOccurrence }}" data-log-line data-log-content="{{ $line }}" class="log-line logs-viewer-line">
                                     @if ($timestamp && $showTimeStamps)
                                         <span class="logs-viewer-timestamp text-gray-500">{{ $timestamp }}</span>
                                     @endif

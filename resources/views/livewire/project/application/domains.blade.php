@@ -2,12 +2,16 @@
     $configuredCount = collect($domainRows)->where('is_suggested', false)->count();
     $suggestedCount = collect($domainRows)->where('is_suggested', true)->count();
     $hasRows = count($domainRows) > 0;
+    $hasDnsChecksInProgress = collect($domainRows)->contains(fn ($row) => $row['dns_status'] === 'checking');
     $composeDomainGroups = collect($domainRows)
         ->groupBy(fn ($row) => $row['service'] ?? '__unknown')
         ->filter(fn ($rows) => $rows->contains(fn ($row) => ! ($row['is_suggested'] ?? false)));
     $helperText = $isCompose
         ? 'Manage domains for every service in this Docker Compose application.'
         : 'Manage domains for this application.';
+    $hasHttpsDomains = collect($domainRows)->contains(
+        fn ($row) => ! ($row['is_suggested'] ?? false) && str_starts_with(strtolower($row['url']), 'https://')
+    );
 @endphp
 
 <div class="flex flex-col gap-4"
@@ -33,6 +37,9 @@
     }"
     @open-edit-domain.window="openEditDomain()"
     @edit-domain-saved.window="closeEditDomain()">
+    @if ($hasDnsChecksInProgress)
+        <div class="hidden" wire:poll.2000ms="pollDnsChecks" aria-hidden="true"></div>
+    @endif
     <x-application.settings-section id="domains-section" title="Domains">
         @can('update', $application)
             <x-slot:actions>
@@ -65,6 +72,18 @@
         <p class="text-sm text-neutral-500 dark:text-fg-dim">
             {{ $helperText }}
         </p>
+
+        @if ($hasHttpsDomains && ! $labelsAreWritable)
+            <div class="mt-4 max-w-md">
+                <x-forms.listbox canGate="update" :canResource="$application" id="isForceHttpsEnabled" label="Redirect HTTP to HTTPS"
+                    onChange="updateForceHttps"
+                    helper="Disable only when Cloudflare Tunnel or another proxy connects to Coolify over HTTP. Keep enabled when Cloudflare uses Full or Full (Strict) SSL."
+                    :options="[
+                        ['value' => true, 'label' => 'Enabled'],
+                        ['value' => false, 'label' => 'Disabled'],
+                    ]" :disabled="! auth()->user()->can('update', $application)" />
+            </div>
+        @endif
 
     </x-application.settings-section>
 
@@ -104,7 +123,7 @@
                             </x-slot:content>
                             <form wire:submit="addDomain" class="application-settings-form flex flex-col gap-4">
                                 @if ($isCompose && count($composeServices) > 0)
-                                    <x-forms.listbox label="Service" id="newDomainService" required
+                                    <x-forms.listbox canGate="update" :canResource="$application" label="Service" id="newDomainService" required
                                         :options="collect($composeServices)->map(fn ($serviceName) => [
                                             'value' => $serviceName,
                                             'label' => $serviceName,

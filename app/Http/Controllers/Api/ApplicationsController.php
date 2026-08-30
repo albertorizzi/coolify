@@ -1604,7 +1604,12 @@ class ApplicationsController extends Controller
             if ($return instanceof JsonResponse) {
                 return $return;
             }
-            $githubApp = GithubApp::whereTeamId($teamId)->where('uuid', $githubAppUuid)->first();
+            $githubApp = GithubApp::where('uuid', $githubAppUuid)
+                ->where(function ($query) use ($teamId) {
+                    $query->where('team_id', $teamId)
+                        ->orWhere('is_system_wide', true);
+                })
+                ->first();
             if (! $githubApp) {
                 return response()->json(['message' => 'Github App not found.'], 404);
             }
@@ -2554,6 +2559,8 @@ class ApplicationsController extends Controller
         }
 
         $this->authorize('delete', $application);
+
+        $application->delete();
 
         DeleteResourceJob::dispatch(
             resource: $application,

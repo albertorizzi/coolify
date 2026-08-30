@@ -2,9 +2,9 @@
 
 return [
     'coolify' => [
-        'version' => env('COOLIFY_VERSION') ?: '4.3.8',
-        'helper_version' => '1.0.15',
-        'realtime_version' => '1.0.17',
+        'version' => env('COOLIFY_VERSION') ?: '4.3.15',
+        'helper_version' => '1.0.16',
+        'realtime_version' => '1.0.18',
         'railpack_version' => '0.23.0',
         'self_hosted' => env('SELF_HOSTED', true),
         'autoupdate' => env('AUTOUPDATE'),
@@ -14,6 +14,7 @@ return [
         'realtime_image' => env('REALTIME_IMAGE', env('REGISTRY_URL', 'docker.io').'/coollabsio/coolify-realtime'),
         'is_windows_docker_desktop' => env('IS_WINDOWS_DOCKER_DESKTOP', false),
         'cdn_url' => env('CDN_URL', 'https://cdn.coollabs.io'),
+        'avatar_cdn_url' => env('AVATAR_CDN_URL'),
         'versions_url' => env('VERSIONS_URL', env('CDN_URL', 'https://cdn.coollabs.io').'/coolify/versions.json'),
         'upgrade_script_url' => env('UPGRADE_SCRIPT_URL', env('CDN_URL', 'https://cdn.coollabs.io').'/coolify/upgrade.sh'),
         'releases_url' => env('RELEASES_URL', 'https://cdn.coollabs.io/coolify/releases.json'),
@@ -71,7 +72,6 @@ return [
         'mux_persist_time' => env('SSH_MUX_PERSIST_TIME', 3600),
         'mux_health_check_enabled' => env('SSH_MUX_HEALTH_CHECK_ENABLED', true),
         'mux_health_check_timeout' => env('SSH_MUX_HEALTH_CHECK_TIMEOUT', 5),
-        'mux_max_age' => env('SSH_MUX_MAX_AGE', 1800), // 30 minutes
         'mux_lock_ttl' => env('SSH_MUX_LOCK_TTL', 30), // lock auto-release, seconds
         'mux_lock_timeout' => env('SSH_MUX_LOCK_TIMEOUT', 10), // max wait for lock, seconds
         'mux_orphan_min_age' => env('SSH_MUX_ORPHAN_MIN_AGE', 600), // min process age before reaping orphans, seconds

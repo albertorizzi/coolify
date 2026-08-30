@@ -166,11 +166,13 @@ function format_docker_labels_to_json(string|array $rawOutput): Collection
             $outputArray = explode(',', $outputLine);
 
             return collect($outputArray)
-                ->map(function ($outputLine) {
-                    return explode('=', $outputLine);
-                })
                 ->mapWithKeys(function ($outputLine) {
-                    return [$outputLine[0] => $outputLine[1]];
+                    $label = explode('=', $outputLine, 2);
+                    if (count($label) !== 2) {
+                        return [];
+                    }
+
+                    return [$label[0] => $label[1]];
                 });
         })[0];
 }
@@ -263,6 +265,36 @@ function dockerStopCommand(int $timeout, string $containers, Server|string|null 
 
     return $command;
 }
+
+function dockerRemoveCommandWithTimeout(string $container, int $timeout = 60, int $killAfter = 10): string
+{
+    $container = escapeShellValue($container);
+    $script = "if command -v timeout >/dev/null 2>&1; then output=\$(timeout -k {$killAfter}s {$timeout}s docker rm -f {$container} 2>&1); exit_code=\$?; else output=''; exit_code=124; fi; if [ \"\$exit_code\" -eq 124 ]; then echo '__COOLIFY_CONTAINER_REMOVE_TIMEOUT__'; elif [ \"\$exit_code\" -ne 0 ] && printf '%s' \"\$output\" | grep -q 'No such container:'; then exit 0; elif [ \"\$exit_code\" -ne 0 ]; then printf '%s\\n' \"\$output\" >&2; else printf '%s\\n' \"\$output\"; fi; exit \$exit_code";
+
+    return 'bash -c '.escapeShellValue($script);
+}
+
+function dockerRemoveCommand(string $container): string
+{
+    $command = 'docker rm -f '.escapeShellValue($container);
+
+    return dockerCommandIgnoringError($command, 'No such container:');
+}
+
+function dockerNetworkRemoveCommand(string $network): string
+{
+    $command = 'docker network rm '.escapeShellValue($network);
+
+    return dockerCommandIgnoringError($command, 'network .* not found');
+}
+
+function dockerCommandIgnoringError(string $command, string $ignoredError): string
+{
+    $script = "output=\$({$command} 2>&1); exit_code=\$?; if [ \"\$exit_code\" -ne 0 ] && printf '%s' \"\$output\" | grep -Eq ".escapeShellValue($ignoredError)."; then exit 0; fi; if [ \"\$exit_code\" -ne 0 ]; then printf '%s\\n' \"\$output\" >&2; else printf '%s\\n' \"\$output\"; fi; exit \$exit_code";
+
+    return 'bash -c '.escapeShellValue($script);
+}
+
 function escapeShellValue(string $value): string
 {
     return "'".str_replace("'", "'\\''", $value)."'";
@@ -518,6 +550,10 @@ function fqdnLabelsForCaddy(string $network, string $uuid, Collection $domains, 
         $path = $url->getPath();
         $host_without_www = str($host)->replace('www.', '');
         $schema = $url->getScheme();
+        $siteAddress = "{$schema}://{$host}";
+        if ($schema === 'https' && ! $is_force_https_enabled) {
+            $siteAddress = "http://{$host}, https://{$host}";
+        }
         $port = $url->getPort();
         $handle = 'handle_path';
         if (! $is_stripprefix_enabled) {
@@ -529,7 +565,7 @@ function fqdnLabelsForCaddy(string $network, string $uuid, Collection $domains, 
         if (is_null($port) && $predefinedPort) {
             $port = $predefinedPort;
         }
-        $labels->push("caddy_{$loop}={$schema}://{$host}");
+        $labels->push("caddy_{$loop}={$siteAddress}");
         if (isNoindexDomain($domain, $noindex_domains)) {
             // Caddy's header directive takes either inline arguments or a block,
             // never both, so -Server has to move into the block alongside it.
@@ -549,11 +585,12 @@ function fqdnLabelsForCaddy(string $network, string $uuid, Collection $domains, 
         if ($is_gzip_enabled) {
             $labels->push("caddy_{$loop}.encode=zstd gzip");
         }
+        $redirect_schema = $is_force_https_enabled ? $schema : '{scheme}';
         if ($redirect_direction === 'www' && ! str($host)->startsWith('www.')) {
-            $labels->push("caddy_{$loop}.redir={$schema}://www.{$host}{uri}");
+            $labels->push("caddy_{$loop}.redir={$redirect_schema}://www.{$host}{uri}");
         }
         if ($redirect_direction === 'non-www' && str($host)->startsWith('www.')) {
-            $labels->push("caddy_{$loop}.redir={$schema}://{$host_without_www}{uri}");
+            $labels->push("caddy_{$loop}.redir={$redirect_schema}://{$host_without_www}{uri}");
         }
         if ($is_http_basic_auth_enabled) {
             $labels->push("caddy_{$loop}.basicauth.{$http_basic_auth_username}=\"{$hashedPassword}\"");
@@ -696,8 +733,7 @@ function fqdnLabelsForTraefik(string $uuid, Collection $domains, bool $is_force_
                         $middlewares->push($middleware_name);
                     });
                     if ($middlewares->isNotEmpty()) {
-                        $middlewares = $middlewares->join(',');
-                        $labels->push("traefik.http.routers.{$https_label}.middlewares={$middlewares}");
+                        $labels->push("traefik.http.routers.{$https_label}.middlewares={$middlewares->join(',')}");
                     }
                 } else {
                     $middlewares = collect([]);
@@ -725,8 +761,7 @@ function fqdnLabelsForTraefik(string $uuid, Collection $domains, bool $is_force_
                         $middlewares->push($middleware_name);
                     });
                     if ($middlewares->isNotEmpty()) {
-                        $middlewares = $middlewares->join(',');
-                        $labels->push("traefik.http.routers.{$https_label}.middlewares={$middlewares}");
+                        $labels->push("traefik.http.routers.{$https_label}.middlewares={$middlewares->join(',')}");
                     }
                 }
                 $labels->push("traefik.http.routers.{$https_label}.tls=true");
@@ -739,15 +774,17 @@ function fqdnLabelsForTraefik(string $uuid, Collection $domains, bool $is_force_
                     $labels->push("traefik.http.services.{$http_label}.loadbalancer.server.port=$port");
                     $labels->push("traefik.http.routers.{$http_label}.service={$http_label}");
                 }
-                $middlewares = collect([]);
-                if ($is_noindex) {
-                    $middlewares->push($noindex_name);
-                }
                 if ($is_force_https_enabled) {
-                    $middlewares->push('redirect-to-https');
+                    $httpMiddlewares = collect([]);
+                    if ($is_noindex) {
+                        $httpMiddlewares->push($noindex_name);
+                    }
+                    $httpMiddlewares->push('redirect-to-https');
+                } else {
+                    $httpMiddlewares = $middlewares;
                 }
-                if ($middlewares->isNotEmpty()) {
-                    $labels->push("traefik.http.routers.{$http_label}.middlewares={$middlewares->join(',')}");
+                if ($httpMiddlewares->isNotEmpty()) {
+                    $labels->push("traefik.http.routers.{$http_label}.middlewares={$httpMiddlewares->join(',')}");
                 }
             } else {
                 // Set labels for http
@@ -877,7 +914,6 @@ function generateLabelsApplication(Application $application, ?ApplicationPreview
                             http_basic_auth_username: $application->http_basic_auth_username,
                             http_basic_auth_password: $application->http_basic_auth_password,
                             noindex_domains: $noindexDomains,
-                            escape_redirect_replacement_for_compose: false,
                         ));
                         break;
                 }

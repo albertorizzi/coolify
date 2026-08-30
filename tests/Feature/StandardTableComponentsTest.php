@@ -3,6 +3,12 @@
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Support\Facades\File;
 
+it('contains wide data tables without overflowing their layout', function () {
+    $css = file_get_contents(resource_path('css/app.css'));
+
+    expect($css)->toContain(".data-table {\n    min-width: 0;\n    max-width: 100%;\n    overflow-x: auto;");
+});
+
 it('renders the standard table toolbar controls', function () {
     $html = Blade::render(<<<'BLADE'
         <x-table.toolbar>
@@ -24,7 +30,10 @@ it('renders the standard table toolbar controls', function () {
         ->toContain('wire:model.live="search"')
         ->not->toContain('x-teleport="body"')
         ->not->toContain('floatingDropdown(')
+        ->toContain("panelStyle: 'position: fixed; min-width: 0; visibility: hidden;'")
+        ->toContain("this.panelStyle = 'position: fixed; min-width: 0; visibility: hidden;'")
         ->toContain('position: fixed')
+        ->toContain('min-width: 0')
         ->toContain('getBoundingClientRect()')
         ->toContain('x-show="open"')
         ->toContain('aria-multiselectable="true"')

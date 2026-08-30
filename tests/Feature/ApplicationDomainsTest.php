@@ -1,7 +1,11 @@
 <?php
 
+use App\Jobs\CheckDomainDnsJob;
 use App\Livewire\Project\Application\Domains;
+use App\Livewire\Project\Application\PreviewDomains;
+use App\Livewire\Project\Application\Previews;
 use App\Models\Application;
+use App\Models\ApplicationPreview;
 use App\Models\Environment;
 use App\Models\InstanceSettings;
 use App\Models\Project;
@@ -12,6 +16,7 @@ use App\Models\User;
 use App\Support\ValidationPatterns;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 use Livewire\Livewire;
 
@@ -96,6 +101,478 @@ it('uses safe domain validation rules on the domains form', function () {
         ->and($validator->errors()->has('newDomain'))->toBeTrue();
 });
 
+it('does not add a single-label hostname as an application domain', function () {
+    Livewire::test(Domains::class, ['application' => $this->application->fresh()])
+        ->set('newDomainParts.host', 'aaa')
+        ->call('addDomain')
+        ->assertDispatched('error');
+
+    expect($this->application->fresh()->fqdn)->toBeNull();
+});
+
+it('generates a preview domain when the application has no domain', function () {
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 41,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/41',
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->call('generateDomain')
+        ->assertDispatched('success');
+
+    expect($preview->fresh()->fqdn)
+        ->not->toBeNull()
+        ->toContain('41.');
+});
+
+it('generates compose preview domains when the application has no domains', function () {
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n",
+        'docker_compose_domains' => null,
+    ]);
+
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 42,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/42',
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->call('generateDomain')
+        ->assertDispatched('success');
+
+    expect($preview->fresh()->fqdn)
+        ->not->toBeNull()
+        ->toContain('42.');
+});
+
+it('derives preview domain services from compose and defaults the selected service', function () {
+    Queue::fake();
+
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n  worker-pr-49:\n    image: nginx:alpine\n  database:\n    image: postgres:17\n",
+        'docker_compose_domains' => null,
+    ]);
+
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 49,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/49',
+        'docker_compose_domains' => json_encode([
+            'removed-service' => ['domain' => ''],
+        ]),
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->assertViewHas('composeServices', ['web', 'worker-pr-49'])
+        ->assertSet('newDomainService', 'web')
+        ->set('newDomainService', 'worker-pr-49')
+        ->set('newDomainParts.host', 'worker-preview.example.com')
+        ->call('addDomain')
+        ->assertHasNoErrors()
+        ->assertSet('newDomainService', 'web');
+
+    $preview->generate_preview_fqdn_compose();
+
+    expect(json_decode($preview->fresh()->docker_compose_domains, true))
+        ->toHaveKey('worker-pr-49')
+        ->not->toHaveKey('worker');
+});
+
+it('handles compose parsing failures without exposing stale preview services', function () {
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services: [\n",
+        'docker_compose_domains' => null,
+    ]);
+
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 52,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/52',
+        'docker_compose_domains' => json_encode([
+            'stale-service' => ['domain' => ''],
+        ]),
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->assertViewHas('composeServices', [])
+        ->assertSet('newDomainService', null);
+});
+
+it('does not erase preview domains when compose parsing fails during persistence', function () {
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n  worker:\n    image: nginx:alpine\n",
+    ]);
+
+    $storedDomains = [
+        'web' => ['domain' => 'https://web-preview.example.com'],
+        'worker' => ['domain' => 'https://worker-preview.example.com'],
+    ];
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 53,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/53',
+        'docker_compose_domains' => json_encode($storedDomains),
+        'fqdn' => 'https://web-preview.example.com,https://worker-preview.example.com',
+    ]);
+
+    $component = Livewire::test(PreviewDomains::class, ['preview' => $preview]);
+
+    $application = Mockery::mock($component->instance()->preview->application)->makePartial();
+    $application->shouldReceive('parse')->once()->andThrow(new RuntimeException('Temporary parse failure'));
+    $component->instance()->preview->setRelation('application', $application);
+
+    $component->instance()->removeDomain(0);
+
+    expect(json_decode($preview->fresh()->docker_compose_domains, true))->toBe($storedDomains)
+        ->and($preview->fresh()->fqdn)->toBe('https://web-preview.example.com,https://worker-preview.example.com')
+        ->and($component->get('domainRows'))->toHaveCount(2);
+});
+
+it('preserves empty compose service slots after removing the last preview domain', function () {
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n  worker:\n    image: nginx:alpine\n",
+        'docker_compose_domains' => null,
+    ]);
+
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 50,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/50',
+        'docker_compose_domains' => json_encode([
+            'web' => ['domain' => 'https://web-preview.example.com'],
+        ]),
+        'fqdn' => 'https://web-preview.example.com',
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->call('removeDomain', 0)
+        ->assertViewHas('composeServices', ['web', 'worker']);
+
+    expect(json_decode($preview->fresh()->docker_compose_domains, true))->toBe([
+        'web' => ['domain' => ''],
+        'worker' => ['domain' => ''],
+    ]);
+});
+
+it('rejects missing and unknown services when adding compose preview domains', function (?string $service) {
+    Queue::fake();
+
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n",
+        'docker_compose_domains' => null,
+    ]);
+
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 51,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/51',
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->set('newDomainParts.host', 'preview.example.com')
+        ->set('newDomainService', $service)
+        ->call('addDomain')
+        ->assertHasErrors('newDomainService')
+        ->assertCount('domainRows', 0);
+
+    expect($preview->fresh()->docker_compose_domains)->toBeNull()
+        ->and($preview->fresh()->fqdn)->toBeNull();
+    Queue::assertNothingPushed();
+})->with([null, 'unknown']);
+
+it('generates a compose preview domain only for the selected service', function () {
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n  api:\n    image: nginx:alpine\n",
+        'docker_compose_domains' => json_encode([
+            'web' => ['domain' => 'https://web.example.com'],
+            'api' => ['domain' => 'https://api.example.com'],
+        ]),
+    ]);
+
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 48,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/48',
+        'docker_compose_domains' => json_encode([
+            'web' => ['domain' => 'https://custom-web.example.net'],
+            'api' => ['domain' => 'https://custom-api.example.net'],
+        ]),
+        'fqdn' => 'https://custom-web.example.net,https://custom-api.example.net',
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->set('newDomainService', 'api')
+        ->call('generateDomain')
+        ->assertDispatched('success');
+
+    $domains = json_decode($preview->fresh()->docker_compose_domains, true);
+
+    expect($domains['web']['domain'])->toBe('https://custom-web.example.net')
+        ->and($domains['api']['domain'])->toStartWith('https://custom-api.example.net,')
+        ->and($domains['api']['domain'])->toContain('48.api.example.com');
+});
+
+it('keeps compose services without application domains private when configuring a preview', function () {
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n  worker:\n    image: nginx:alpine\n",
+        'docker_compose_domains' => json_encode([
+            'web' => ['domain' => 'https://web.example.com'],
+            'worker' => ['domain' => ''],
+        ]),
+    ]);
+
+    Livewire::test(Previews::class, ['application' => $this->application->fresh()])
+        ->set('parameters', [
+            'project_uuid' => $this->project->uuid,
+            'environment_uuid' => $this->environment->uuid,
+            'application_uuid' => $this->application->uuid,
+        ])
+        ->call('add', 43, 'https://github.com/coollabsio/coolify/pull/43');
+
+    $preview = ApplicationPreview::query()
+        ->where('application_id', $this->application->id)
+        ->where('pull_request_id', 43)
+        ->firstOrFail();
+    $composeDomains = json_decode($preview->docker_compose_domains, true);
+
+    expect($composeDomains['web']['domain'])
+        ->toContain('web.example.com')
+        ->and($composeDomains['worker']['domain'])->toBe('')
+        ->and($preview->fqdn)->toContain('web.example.com')
+        ->not->toContain('worker');
+});
+
+it('generates a domain when configuring a preview', function () {
+    Livewire::test(Previews::class, ['application' => $this->application->fresh()])
+        ->set('parameters', [
+            'project_uuid' => $this->project->uuid,
+            'environment_uuid' => $this->environment->uuid,
+            'application_uuid' => $this->application->uuid,
+        ])
+        ->call('add', 43, 'https://github.com/coollabsio/coolify/pull/43')
+        ->assertDispatched('success');
+
+    $preview = ApplicationPreview::query()
+        ->where('application_id', $this->application->id)
+        ->where('pull_request_id', 43)
+        ->firstOrFail();
+
+    expect($preview->fqdn)
+        ->not->toBeNull()
+        ->toContain('43.');
+});
+
+it('manages preview domains and their dns status', function () {
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 44,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/44',
+        'fqdn' => 'https://44.example.com',
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->assertSet('domainRows.0.url', 'https://44.example.com')
+        ->call('checkDomainDns', 0)
+        ->assertSet('domainRows.0.dns_status', 'skipped')
+        ->set('newDomainParts.host', 'second.example.com')
+        ->call('addDomain')
+        ->assertHasNoErrors()
+        ->assertDispatched('success')
+        ->assertCount('domainRows', 2)
+        ->call('removeDomain', 0)
+        ->assertCount('domainRows', 1);
+
+    expect($preview->fresh()->fqdn)->toBe('https://second.example.com')
+        ->and($preview->fresh()->domain_dns_statuses)->not->toBeNull();
+});
+
+it('removes the intended preview domains by stable identities after reindexing', function () {
+    $domains = [
+        'https://first.example.com',
+        'https://second.example.com',
+        'https://third.example.com',
+    ];
+    $domainKeys = array_map(fn (string $domain): string => hash('sha256', $domain.'|'), $domains);
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 47,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/47',
+        'fqdn' => implode(',', $domains),
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->call('removeDomainByKey', $domainKeys[0])
+        ->assertSet('domainRows.0.url', $domains[1])
+        ->call('removeDomainByKey', $domainKeys[1])
+        ->assertCount('domainRows', 1)
+        ->assertSet('domainRows.0.url', $domains[2]);
+
+    expect($preview->fresh()->fqdn)->toBe($domains[2]);
+});
+
+it('renders preview domain delete confirmations with stable keys', function () {
+    $domains = [
+        'https://first.example.com',
+        'https://second.example.com',
+    ];
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 48,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/48',
+        'fqdn' => implode(',', $domains),
+    ]);
+
+    $renderedHtml = html_entity_decode(
+        Livewire::test(PreviewDomains::class, ['preview' => $preview])->html(),
+        ENT_QUOTES,
+    );
+
+    foreach ($domains as $domain) {
+        $domainKey = hash('sha256', $domain.'|');
+
+        expect($renderedHtml)->toMatch("/submitAction:\\s*[\"']removeDomainByKey\\({$domainKey}\\)[\"']/");
+    }
+
+    expect($renderedHtml)->not->toMatch('/submitAction:\\s*[\"\']removeDomain\\(\\d+\\)[\"\']/');
+});
+
+it('removes only the matching compose preview domain when services share a URL', function () {
+    $url = 'https://shared.example.com';
+    $this->application->update([
+        'build_pack' => 'dockercompose',
+        'docker_compose_raw' => "services:\n  web:\n    image: nginx:alpine\n  worker:\n    image: nginx:alpine\n",
+    ]);
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 49,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/49',
+        'docker_compose_domains' => json_encode([
+            'web' => ['domain' => $url],
+            'worker' => ['domain' => $url],
+        ]),
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->call('removeDomainByKey', hash('sha256', $url.'|worker'))
+        ->assertCount('domainRows', 1)
+        ->assertSet('domainRows.0.url', $url)
+        ->assertSet('domainRows.0.service', 'web');
+
+    expect(json_decode($preview->fresh()->docker_compose_domains, true))->toBe([
+        'web' => ['domain' => $url],
+        'worker' => ['domain' => ''],
+    ]);
+});
+
+it('adds a preview domain and starts its dns check asynchronously', function () {
+    Queue::fake();
+
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 45,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/45',
+    ]);
+
+    Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->set('newDomainParts.host', 'preview.example.com')
+        ->call('addDomain')
+        ->assertCount('domainRows', 1)
+        ->assertSet('domainRows.0.dns_status', 'checking')
+        ->assertDispatched('success', 'Domain added. DNS check started.');
+
+    Queue::assertPushed(CheckDomainDnsJob::class, fn (CheckDomainDnsJob $job): bool => $job->resource->is($preview)
+        && $job->url === 'https://preview.example.com');
+
+    expect($preview->fresh()->fqdn)->toBe('https://preview.example.com')
+        ->and(collect($preview->fresh()->domain_dns_statuses)->first()['status'])->toBe('checking');
+});
+
+it('notifies when an asynchronous preview dns check finds a mismatch', function () {
+    $url = 'https://preview.example.com';
+    $statusKey = hash('sha256', $url.'|');
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 46,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/46',
+        'fqdn' => $url,
+        'domain_dns_statuses' => [
+            $statusKey => [
+                'status' => 'checking',
+                'message' => 'Checking DNS...',
+                'check_id' => 'preview-check',
+            ],
+        ],
+    ]);
+
+    $component = Livewire::test(PreviewDomains::class, ['preview' => $preview])
+        ->assertSet('domainRows.0.dns_status', 'checking');
+
+    $preview->update([
+        'domain_dns_statuses' => [
+            $statusKey => [
+                'status' => 'failed',
+                'message' => 'Required DNS record type A pointing to 203.0.113.10',
+                'expected_ip' => '203.0.113.10',
+                'checked_at' => now()->toIso8601String(),
+            ],
+        ],
+    ]);
+
+    $component->call('pollDnsChecks')
+        ->assertSet('domainRows.0.dns_status', 'failed')
+        ->assertDispatched('error', 'DNS is not configured for preview.example.com. Review the required DNS record.');
+});
+
+it('does not overwrite a completed preview dns result with stale checking state', function () {
+    $url = 'https://preview.example.com';
+    $statusKey = hash('sha256', $url.'|');
+    $preview = ApplicationPreview::create([
+        'application_id' => $this->application->id,
+        'pull_request_id' => 48,
+        'pull_request_html_url' => 'https://github.com/coollabsio/coolify/pull/48',
+        'fqdn' => $url,
+        'domain_dns_statuses' => [
+            $statusKey => [
+                'status' => 'checking',
+                'message' => 'Checking DNS...',
+                'check_id' => 'stale-check',
+            ],
+        ],
+    ]);
+
+    $component = Livewire::test(PreviewDomains::class, ['preview' => $preview]);
+
+    $preview->update([
+        'domain_dns_statuses' => [
+            $statusKey => [
+                'status' => 'ok',
+                'message' => 'DNS looks correct.',
+                'check_id' => 'completed-check',
+            ],
+        ],
+    ]);
+
+    $method = new ReflectionMethod($component->instance(), 'persistDnsStatuses');
+    $method->invoke($component->instance());
+
+    expect($preview->fresh()->domain_dns_statuses[$statusKey])
+        ->toMatchArray([
+            'status' => 'ok',
+            'message' => 'DNS looks correct.',
+            'check_id' => 'completed-check',
+        ]);
+});
+
 it('lists existing domains as individual rows', function () {
     $this->application->update([
         'fqdn' => 'https://example.com,https://www.example.com,https://another.example.com,https://www.another.example.com',
@@ -117,6 +594,27 @@ it('lists existing domains as individual rows', function () {
         ->html();
 
     expect(substr_count($html, 'this.$wire.updateRedirect('))->toBe(2);
+});
+
+it('shows the HTTP redirect control for HTTPS domains and persists changes', function () {
+    $this->application->update(['fqdn' => 'https://app.example.com']);
+
+    Livewire::test(Domains::class, ['application' => $this->application->fresh()])
+        ->assertSet('isForceHttpsEnabled', true)
+        ->assertSee('Redirect HTTP to HTTPS')
+        ->assertSee('Keep enabled when Cloudflare uses Full or Full (Strict) SSL.')
+        ->set('isForceHttpsEnabled', false)
+        ->call('updateForceHttps')
+        ->assertHasNoErrors();
+
+    expect($this->application->settings->fresh()->is_force_https_enabled)->toBeFalse();
+});
+
+it('hides the HTTP redirect control for HTTP-only domains', function () {
+    $this->application->update(['fqdn' => 'http://app.example.com']);
+
+    Livewire::test(Domains::class, ['application' => $this->application->fresh()])
+        ->assertDontSee('Redirect HTTP to HTTPS');
 });
 
 it('shows one redirect direction control in each compose service header', function () {
@@ -227,7 +725,7 @@ it('adds a domain to the application', function () {
         ->call('addDomain')
         ->assertHasNoErrors()
         ->assertSet('addDomainDnsFailed', false)
-        ->assertDispatched('success')
+        ->assertDispatched('success', 'Domain added. DNS check started.')
         ->assertDispatched('close-modal');
 
     $this->application->refresh();
@@ -269,7 +767,9 @@ it('adds multiple domains without replacing existing ones', function () {
         ->toContain('https://api.example.com');
 });
 
-it('blocks adding a domain with bad dns until the user continues', function () {
+it('saves a domain before checking dns in a separate request', function () {
+    Queue::fake();
+
     $settings = InstanceSettings::get();
     $settings->is_dns_validation_enabled = true;
     $settings->save();
@@ -277,15 +777,8 @@ it('blocks adding a domain with bad dns until the user continues', function () {
     $component = Livewire::test(Domains::class, ['application' => $this->application->fresh()])
         ->set('newDomain', 'https://this-domain-should-not-resolve-for-coolify-tests.invalid')
         ->call('addDomain')
-        ->assertSet('addDomainDnsFailed', true)
-        ->assertSee('DNS is not pointing to the right IP')
-        ->assertSee('Are you sure you want to add it anyway');
-
-    $this->application->refresh();
-    expect($this->application->fqdn)->toBeNull();
-
-    $component->call('confirmAddDomainDespiteDns')
         ->assertSet('addDomainDnsFailed', false)
+        ->assertSet('domainRows.0.dns_status', 'checking')
         ->assertDispatched('success')
         ->assertDispatched('close-modal');
 
@@ -294,17 +787,24 @@ it('blocks adding a domain with bad dns until the user continues', function () {
         'https://this-domain-should-not-resolve-for-coolify-tests.invalid',
         'https://www.this-domain-should-not-resolve-for-coolify-tests.invalid',
     ]);
+
+    expect($this->application->domain_dns_statuses['https://this-domain-should-not-resolve-for-coolify-tests.invalid']['status'] ?? null)
+        ->toBe('checking');
+
+    Queue::assertPushed(CheckDomainDnsJob::class, 2);
+
+    $jobs = Queue::pushed(CheckDomainDnsJob::class);
+
+    expect($jobs->pluck('statusKey')->all())->toEqualCanonicalizing([
+        'https://this-domain-should-not-resolve-for-coolify-tests.invalid',
+        'https://www.this-domain-should-not-resolve-for-coolify-tests.invalid',
+    ])->and($jobs->pluck('checkId')->unique())->toHaveCount(2);
 });
 
 it('resets the dns gate when the domain input changes', function () {
-    $settings = InstanceSettings::get();
-    $settings->is_dns_validation_enabled = true;
-    $settings->save();
-
     Livewire::test(Domains::class, ['application' => $this->application->fresh()])
-        ->set('newDomain', 'https://this-domain-should-not-resolve-for-coolify-tests.invalid')
-        ->call('addDomain')
-        ->assertSet('addDomainDnsFailed', true)
+        ->set('addDomainDnsFailed', true)
+        ->set('forceSaveDns', true)
         ->set('newDomain', 'https://another.example.com')
         ->assertSet('addDomainDnsFailed', false)
         ->assertSet('forceSaveDns', false);
@@ -326,7 +826,8 @@ it('updates a domain in place via modal', function () {
         ->assertHasNoErrors()
         ->assertSet('showEditDomainModal', false)
         ->assertDispatched('edit-domain-saved')
-        ->assertDispatched('success');
+        ->assertDispatched('success')
+        ->assertNotDispatched('error');
 
     $this->application->refresh();
 
@@ -375,6 +876,21 @@ it('removes a domain', function () {
     $this->application->refresh();
 
     expect($this->application->fqdn)->toBe('https://www.example.com');
+});
+
+it('removes consecutive domains by stable row identity after indexes change', function () {
+    $this->application->update([
+        'fqdn' => 'https://first.example.com,https://second.example.com,https://third.example.com',
+    ]);
+
+    $component = Livewire::test(Domains::class, ['application' => $this->application->fresh()]);
+
+    $component
+        ->call('removeDomainByKey', hash('sha256', 'https://first.example.com|'))
+        ->call('removeDomainByKey', hash('sha256', 'https://second.example.com|'))
+        ->assertDispatched('success');
+
+    expect($this->application->fresh()->fqdn)->toBe('https://third.example.com');
 });
 
 it('does not revalidate dns on remaining domains when removing one', function () {
@@ -704,6 +1220,98 @@ it('persists dns status after checking a domain', function () {
     expect($entry)->toBeArray()
         ->and($entry['status'] ?? null)->toBe('failed')
         ->and($entry['checked_at'] ?? null)->not->toBeNull();
+});
+
+it('polls a queued dns check and notifies about a mismatch', function () {
+    $domain = 'https://app.example.com';
+    $this->application->update([
+        'fqdn' => $domain,
+        'domain_dns_statuses' => [
+            $domain => [
+                'status' => 'checking',
+                'message' => 'Checking DNS...',
+                'expected_ip' => '203.0.113.10',
+                'checked_at' => null,
+            ],
+        ],
+    ]);
+
+    $component = Livewire::test(Domains::class, ['application' => $this->application->fresh()])
+        ->assertSee('Checking DNS...')
+        ->assertSee('wire:poll.2000ms="pollDnsChecks"', false);
+
+    $this->application->update([
+        'domain_dns_statuses' => [
+            $domain => [
+                'status' => 'failed',
+                'message' => 'Required DNS record type A pointing to 203.0.113.10',
+                'expected_ip' => '203.0.113.10',
+                'checked_at' => now()->toIso8601String(),
+            ],
+        ],
+    ]);
+
+    $component->call('pollDnsChecks')
+        ->assertSet('domainRows.0.dns_status', 'failed')
+        ->assertDispatched('error', 'DNS is not configured for app.example.com. Review the required DNS record.');
+});
+
+it('does not overwrite a completed queued dns result with stale checking state', function () {
+    $domain = 'https://app.example.com';
+    $this->application->update([
+        'fqdn' => $domain,
+        'domain_dns_statuses' => [
+            $domain => [
+                'status' => 'checking',
+                'message' => 'Checking DNS...',
+                'expected_ip' => '203.0.113.10',
+                'checked_at' => null,
+            ],
+        ],
+    ]);
+
+    $component = Livewire::test(Domains::class, ['application' => $this->application->fresh()]);
+
+    $this->application->update([
+        'domain_dns_statuses' => [
+            $domain => [
+                'status' => 'ok',
+                'message' => 'DNS looks correct.',
+                'expected_ip' => '203.0.113.10',
+                'checked_at' => now()->toIso8601String(),
+            ],
+        ],
+    ]);
+
+    $method = new ReflectionMethod($component->instance(), 'persistDomainDnsStatuses');
+    $method->invoke($component->instance());
+
+    expect($this->application->fresh()->domain_dns_statuses[$domain]['status'])->toBe('ok');
+});
+
+it('does not overwrite a newer queued dns check with stale completed component state', function () {
+    $domain = 'https://app.example.com';
+    $status = [
+        'status' => 'ok',
+        'message' => 'DNS looks correct.',
+        'expected_ip' => '203.0.113.10',
+        'checked_at' => null,
+        'check_id' => null,
+    ];
+    $this->application->update([
+        'fqdn' => $domain,
+        'domain_dns_statuses' => [$domain => $status],
+    ]);
+
+    $component = Livewire::test(Domains::class, ['application' => $this->application->fresh()]);
+
+    $status['check_id'] = 'newer-check';
+    $this->application->update(['domain_dns_statuses' => [$domain => $status]]);
+
+    $method = new ReflectionMethod($component->instance(), 'persistDomainDnsStatuses');
+    $method->invoke($component->instance());
+
+    expect($this->application->fresh()->domain_dns_statuses[$domain]['check_id'])->toBe('newer-check');
 });
 
 it('resolves hostname server addresses to a real ip for dns messages', function () {

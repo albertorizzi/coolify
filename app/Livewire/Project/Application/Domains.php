@@ -2,6 +2,8 @@
 
 namespace App\Livewire\Project\Application;
 
+use App\Actions\Shared\CheckDomainDns;
+use App\Jobs\CheckDomainDnsJob;
 use App\Livewire\Concerns\InteractsWithCloudflareDomainConnect;
 use App\Livewire\Project\Shared\ConfigurationChecker;
 use App\Models\Application;
@@ -10,6 +12,7 @@ use App\Support\DomainUrlParts;
 use App\Support\ValidationPatterns;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Livewire\Component;
 
 class Domains extends Component
@@ -22,6 +25,8 @@ class Domains extends Component
     public Application $application;
 
     public string $redirect = 'both';
+
+    public bool $isForceHttpsEnabled = true;
 
     /**
      * Per compose-service www/non-www redirect direction.
@@ -109,6 +114,7 @@ class Domains extends Component
             'newDomain' => ValidationPatterns::applicationDomainRules(),
             'editingDomain' => ValidationPatterns::applicationDomainRules(),
             'redirect' => 'string|required|in:both,www,non-www',
+            'isForceHttpsEnabled' => 'boolean',
             'serviceRedirects' => 'array',
             'serviceRedirects.*' => 'string|in:both,www,non-www',
         ];
@@ -138,6 +144,39 @@ class Domains extends Component
         $this->loadDomainState();
     }
 
+    public function pollDnsChecks(): void
+    {
+        $this->authorize('view', $this->application);
+
+        $checkingRows = collect($this->domainRows)
+            ->where('dns_status', 'checking')
+            ->values();
+
+        $this->refreshDomains();
+
+        foreach ($checkingRows as $checkingRow) {
+            $row = collect($this->domainRows)->first(fn (array $row): bool => $row['url'] === $checkingRow['url']
+                && ($row['service'] ?? null) === ($checkingRow['service'] ?? null));
+
+            if (! is_array($row) || $row['dns_status'] === 'checking') {
+                continue;
+            }
+
+            $this->dispatchDnsCheckNotification($row['url'], $row['dns_status']);
+        }
+    }
+
+    protected function dispatchDnsCheckNotification(string $url, string $status): void
+    {
+        $host = parse_url($url, PHP_URL_HOST) ?: $url;
+
+        match ($status) {
+            'ok' => $this->dispatch('success', "DNS is configured correctly for {$host}."),
+            'failed' => $this->dispatch('error', "DNS is not configured for {$host}. Review the required DNS record."),
+            default => $this->dispatch('info', "DNS check skipped for {$host}."),
+        };
+    }
+
     public function toggleNoindexDomain(string $domain, string|bool $indexing): void
     {
         $this->authorize('update', $this->application);
@@ -160,6 +199,18 @@ class Domains extends Component
         $this->setRedirect();
     }
 
+    public function updateForceHttps(): void
+    {
+        $this->authorize('update', $this->application);
+        $this->validateOnly('isForceHttpsEnabled');
+
+        $this->application->settings->is_force_https_enabled = $this->isForceHttpsEnabled;
+        $this->application->settings->save();
+        $this->resetDefaultLabels();
+        $this->dispatch('configurationChanged')->to(ConfigurationChecker::class);
+        $this->dispatch('success', 'HTTP to HTTPS redirect updated.');
+    }
+
     public function loadDomainState(): void
     {
         $this->application->refresh();
@@ -168,6 +219,7 @@ class Domains extends Component
         $this->isCompose = $this->application->build_pack === 'dockercompose';
         $this->labelsAreWritable = $this->application->settings->is_container_label_readonly_enabled === false;
         $this->redirect = $this->application->redirect ?? 'both';
+        $this->isForceHttpsEnabled = $this->application->isForceHttpsEnabled();
 
         $settings = instanceSettings();
         $this->dnsValidationEnabled = (bool) data_get($settings, 'is_dns_validation_enabled', true);
@@ -448,6 +500,7 @@ class Domains extends Component
                 'dns_message' => (string) data_get($entry, 'message', 'Not checked yet.'),
                 'expected_ip' => data_get($entry, 'expected_ip') ?: $this->serverIp,
                 'checked_at' => data_get($entry, 'checked_at'),
+                'check_id' => data_get($entry, 'check_id'),
                 'is_suggested' => false,
                 'suggested_for' => null,
                 'suggestion_label' => null,
@@ -462,6 +515,7 @@ class Domains extends Component
             'dns_message' => 'Not checked yet.',
             'expected_ip' => $this->serverIp,
             'checked_at' => null,
+            'check_id' => null,
             'is_suggested' => false,
             'suggested_for' => null,
             'suggestion_label' => null,
@@ -517,6 +571,8 @@ class Domains extends Component
                 || ! $server
                 || $this->application->additional_servers->count() > 0;
 
+            $indexesToCheck = [];
+
             foreach ($this->domainRows as $index => $row) {
                 if ($skipDns) {
                     $reason = ! $this->dnsValidationEnabled
@@ -532,7 +588,11 @@ class Domains extends Component
                     continue;
                 }
 
-                $this->applyDnsStatus($index, $row['url'], $server);
+                $indexesToCheck[] = $index;
+            }
+
+            if ($server && $indexesToCheck !== []) {
+                $this->applyDnsStatuses($indexesToCheck, $server);
             }
 
             $this->persistDomainDnsStatuses();
@@ -559,45 +619,50 @@ class Domains extends Component
             return;
         }
 
-        $this->applyDnsStatus($index, $this->domainRows[$index]['url'], $server);
+        $this->applyDnsStatus($index, $server);
         $this->persistDomainDnsStatuses();
     }
 
-    protected function applyDnsStatus(int $index, string $url, Server $server): void
+    protected function applyDnsStatus(int $index, Server $server): void
     {
-        $target = $this->dnsTargetLabel();
+        $this->applyDnsStatuses([$index], $server);
+    }
 
-        try {
-            $isValid = validateDNSEntry($url, $server);
-            if ($isValid) {
-                $this->domainRows[$index]['dns_status'] = 'ok';
-                $this->domainRows[$index]['dns_message'] = $target
-                    ? "DNS points to {$target} (or Cloudflare)."
-                    : 'DNS looks correct.';
-            } else {
-                $this->domainRows[$index]['dns_status'] = 'failed';
-                $this->domainRows[$index]['dns_message'] = dnsMismatchGuidanceMessage($target, $this->serverIp);
+    /**
+     * @param  array<int, int>  $indexes
+     */
+    protected function applyDnsStatuses(array $indexes, Server $server): void
+    {
+        $entries = [];
+
+        foreach ($indexes as $index) {
+            $entries[(string) $index] = $this->domainRows[$index]['url'];
+        }
+
+        $results = CheckDomainDns::run($entries, $server, $this->serverIp);
+
+        foreach ($results as $index => $result) {
+            $index = (int) $index;
+            $this->domainRows[$index]['dns_status'] = $result['status'];
+            $this->domainRows[$index]['dns_message'] = $result['message'];
+
+            // Keep suggested-row copy short after DNS checks (no role badge).
+            if ($this->domainRows[$index]['is_suggested'] ?? false) {
+                $isWww = str_starts_with(strtolower((string) $this->domainHost((string) $this->domainRows[$index]['url'])), 'www.');
+                $serviceName = $this->domainRows[$index]['service'] ?? null;
+                $meta = $this->suggestedDomainMeta(
+                    $isWww,
+                    $this->serviceRedirectFor(is_string($serviceName) ? $serviceName : null)
+                );
+                $this->domainRows[$index]['dns_message'] = $meta['pending_message'];
+                $this->domainRows[$index]['suggestion_label'] = null;
+                $this->domainRows[$index]['suggestion_role'] = $meta['role'];
             }
-        } catch (\Throwable) {
-            $this->domainRows[$index]['dns_status'] = 'failed';
-            $this->domainRows[$index]['dns_message'] = 'Could not validate DNS for this domain.';
-        }
 
-        // Keep suggested-row copy short after DNS checks (no role badge).
-        if ($this->domainRows[$index]['is_suggested'] ?? false) {
-            $isWww = str_starts_with(strtolower((string) $this->domainHost((string) $this->domainRows[$index]['url'])), 'www.');
-            $serviceName = $this->domainRows[$index]['service'] ?? null;
-            $meta = $this->suggestedDomainMeta(
-                $isWww,
-                $this->serviceRedirectFor(is_string($serviceName) ? $serviceName : null)
-            );
-            $this->domainRows[$index]['dns_message'] = $meta['pending_message'];
-            $this->domainRows[$index]['suggestion_label'] = null;
-            $this->domainRows[$index]['suggestion_role'] = $meta['role'];
+            $this->domainRows[$index]['expected_ip'] = $result['expected_ip'];
+            $this->domainRows[$index]['checked_at'] = $result['checked_at'];
+            $this->domainRows[$index]['check_id'] = null;
         }
-
-        $this->domainRows[$index]['expected_ip'] = $this->serverIp;
-        $this->domainRows[$index]['checked_at'] = now()->toIso8601String();
     }
 
     /**
@@ -631,11 +696,34 @@ class Domains extends Component
                 'message' => (string) ($row['dns_message'] ?? ''),
                 'expected_ip' => $row['expected_ip'] ?? $this->serverIp,
                 'checked_at' => $row['checked_at'] ?? now()->toIso8601String(),
+                'check_id' => $row['check_id'] ?? null,
             ];
         }
 
+        DB::transaction(function () use (&$statuses): void {
+            $application = Application::query()->lockForUpdate()->findOrFail($this->application->id);
+            $storedStatuses = $application->domain_dns_statuses ?? [];
+
+            foreach ($statuses as $key => $status) {
+                $localCheckId = $status['check_id'] ?? null;
+                $storedCheckId = $storedStatuses[$key]['check_id'] ?? null;
+
+                if ($storedCheckId !== null && $localCheckId !== $storedCheckId) {
+                    $statuses[$key] = $storedStatuses[$key];
+
+                    continue;
+                }
+
+                if ($status['status'] === 'checking' && isset($storedStatuses[$key]) && $storedStatuses[$key]['status'] !== 'checking') {
+                    $statuses[$key] = $storedStatuses[$key];
+                }
+            }
+
+            $application->domain_dns_statuses = $statuses === [] ? null : $statuses;
+            $application->save();
+        });
+
         $this->application->domain_dns_statuses = $statuses === [] ? null : $statuses;
-        $this->application->save();
     }
 
     protected function pruneDomainDnsStatusesToCurrentDomains(): void
@@ -788,16 +876,6 @@ class Domains extends Component
                 }
             }
 
-            if (! $this->forceSaveDns && $this->shouldValidateDnsForAdd()) {
-                $dnsFailure = $this->findDnsFailureMessage($newUrls);
-                if ($dnsFailure !== null) {
-                    $this->addDomainDnsFailed = true;
-                    $this->addDomainDnsMessage = $dnsFailure;
-
-                    return;
-                }
-            }
-
             $merged = $current->merge($newUrls)->merge($pairedUrls)->unique()->values();
             $this->pendingAction = 'add';
             if (! $this->saveDomainList($merged, $this->newDomainService)) {
@@ -809,12 +887,108 @@ class Domains extends Component
             $serviceForCheck = $this->newDomainService;
             $this->resetAddDomainForm();
             $this->dispatch('close-modal');
-            $this->dispatch('success', 'Domain added.');
             $this->refreshDomains();
-            $this->checkUrlsDns(array_values(array_unique(array_merge($newUrls, $pairedUrls))), $serviceForCheck);
+            $urlsToCheck = array_values(array_unique(array_merge($newUrls, $pairedUrls)));
+            $dnsChecks = collect($this->dnsEntriesForUrls($urlsToCheck, $serviceForCheck))
+                ->map(fn (string $url, string $statusKey) => [
+                    'status_key' => $statusKey,
+                    'url' => $url,
+                    'check_id' => new_public_id(),
+                ]);
+
+            foreach ($dnsChecks as $dnsCheck) {
+                $this->markUrlsAsChecking([$dnsCheck['url']], $serviceForCheck, $dnsCheck['check_id']);
+            }
+            $this->persistDomainDnsStatuses();
+
+            $failedDnsChecks = 0;
+            foreach ($dnsChecks as $dnsCheck) {
+                try {
+                    CheckDomainDnsJob::dispatch(
+                        $this->application,
+                        $dnsCheck['status_key'],
+                        $dnsCheck['url'],
+                        $this->application->destination?->server,
+                        $this->serverIp,
+                        $dnsCheck['check_id'],
+                        $this->application->additional_servers->count() > 0,
+                    );
+                } catch (\Throwable) {
+                    $failedDnsChecks++;
+                    $this->markUrlsDnsCheckUnavailable([$dnsCheck['url']], $serviceForCheck, $dnsCheck['check_id']);
+                }
+            }
+
+            if ($failedDnsChecks > 0) {
+                $this->persistDomainDnsStatuses();
+                $this->dispatch('error', 'Some DNS checks could not be started. Try again from the Domains page.');
+            }
+
+            $this->dispatch('success', $failedDnsChecks === $dnsChecks->count()
+                ? 'Domain added.'
+                : 'Domain added. DNS check started.');
         } catch (\Throwable $e) {
             handleError($e, $this);
         }
+    }
+
+    /**
+     * @param  array<int, string>  $urls
+     */
+    protected function markUrlsAsChecking(array $urls, ?string $service = null, ?string $checkId = null): void
+    {
+        $indexesToCheck = [];
+
+        foreach ($this->domainRows as $index => $row) {
+            if (! in_array($row['url'], $urls, true)) {
+                continue;
+            }
+
+            if ($service !== null && ($row['service'] ?? null) !== $service) {
+                continue;
+            }
+
+            $this->domainRows[$index]['dns_status'] = 'checking';
+            $this->domainRows[$index]['dns_message'] = 'Checking DNS...';
+            $this->domainRows[$index]['check_id'] = $checkId;
+        }
+    }
+
+    /**
+     * @param  array<int, string>  $urls
+     */
+    protected function markUrlsDnsCheckUnavailable(array $urls, ?string $service = null, ?string $checkId = null): void
+    {
+        $this->markUrlsAsChecking($urls, $service, $checkId);
+
+        foreach ($this->domainRows as $index => $row) {
+            if (! in_array($row['url'], $urls, true)) {
+                continue;
+            }
+
+            if ($service !== null && ($row['service'] ?? null) !== $service) {
+                continue;
+            }
+
+            $this->domainRows[$index]['dns_status'] = 'skipped';
+            $this->domainRows[$index]['dns_message'] = 'DNS check could not be started.';
+            $this->domainRows[$index]['checked_at'] = now()->toIso8601String();
+        }
+    }
+
+    /**
+     * @param  array<int, string>  $urls
+     * @return array<string, string>
+     */
+    protected function dnsEntriesForUrls(array $urls, ?string $service = null): array
+    {
+        $entries = [];
+
+        foreach ($urls as $url) {
+            $entries[$this->domainDnsStatusKey($url, $service)] = $url;
+        }
+
+        return $entries;
     }
 
     /**
@@ -833,6 +1007,7 @@ class Domains extends Component
         $skipDns = ! $this->dnsValidationEnabled
             || ! $server
             || $this->application->additional_servers->count() > 0;
+        $indexesToCheck = [];
 
         foreach ($this->domainRows as $index => $row) {
             $url = $row['url'] ?? null;
@@ -859,7 +1034,11 @@ class Domains extends Component
                 continue;
             }
 
-            $this->applyDnsStatus($index, $url, $server);
+            $indexesToCheck[] = $index;
+        }
+
+        if ($server && $indexesToCheck !== []) {
+            $this->applyDnsStatuses($indexesToCheck, $server);
         }
 
         $this->persistDomainDnsStatuses();
@@ -893,15 +1072,11 @@ class Domains extends Component
             return null;
         }
 
-        $target = $this->dnsTargetLabel() ?? $server->ip;
+        $results = CheckDomainDns::run(array_combine($urls, $urls), $server, $this->serverIp);
 
-        foreach ($urls as $url) {
-            try {
-                if (! validateDNSEntry($url, $server)) {
-                    return dnsMismatchGuidanceMessage($target, $this->serverIp);
-                }
-            } catch (\Throwable) {
-                return 'Could not validate DNS for this domain.';
+        foreach ($results as $result) {
+            if ($result['status'] === 'failed') {
+                return $result['message'];
             }
         }
 
@@ -1146,6 +1321,28 @@ class Domains extends Component
         } catch (\Throwable $e) {
             handleError($e, $this);
         }
+    }
+
+    public function removeDomainByKey(string $domainKey): void
+    {
+        $index = collect($this->domainRows)->search(
+            fn (array $row): bool => ! ($row['is_suggested'] ?? false)
+                && hash_equals($domainKey, $this->domainRowKey($row))
+        );
+
+        if ($index === false) {
+            return;
+        }
+
+        $this->removeDomain((int) $index);
+    }
+
+    /**
+     * @param  array{url: string, service?: ?string}  $row
+     */
+    private function domainRowKey(array $row): string
+    {
+        return hash('sha256', $row['url'].'|'.($row['service'] ?? ''));
     }
 
     public function generateDomain(?string $serviceName = null): void
